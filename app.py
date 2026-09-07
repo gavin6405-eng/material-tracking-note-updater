@@ -8,410 +8,465 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 try:
     import streamlit as st
-except ModuleNotFoundError:  # 允許在未安裝 Streamlit 的環境執行核心比對測試
+except ModuleNotFoundError:  # 核心邏輯可在未安裝 Streamlit 時測試
     st = None
 
 
-APP_TITLE = "倉庫物管發料 × 物料追蹤彙整"
-WEEKLY_SHEET_PATTERN = re.compile(r"^\d{4}~\d{4}$")
-
-
-def normalize_header(value: Any) -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    text = str(value).strip().upper()
-    return re.sub(r"[\s\n\r\t_（）()／/\-]+", "", text)
-
-
-def normalize_key(value: Any) -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    return re.sub(r"\s+", "", str(value).strip()).upper()
+APP_TITLE = "生管排程 × 製令缺料 × 客戶領料補料"
+APP_VERSION = "V4－三表料號補料版"
+WO_PATTERN = re.compile(r"(\d{2}[A-Z]{1,3}\d{4})-(\d{2})(?:\s*[~～]\s*(\d{2}))?", re.I)
 
 
 ALIASES = {
-    "WO": ["製令", "專案代號", "製令單"],
+    "MATERIAL": ["材料品號", "料號", "品號"],
+    "NAME": ["品名", "材料名稱"],
+    "SPEC": ["規格"],
+    "RECEIPT_QTY": ["領料數量", "實際領料數量", "數量"],
+    "RECEIPT_NO": ["領料單號", "單據號碼"],
+    "UNIT": ["單位"],
+    "NOTE": ["備註"],
+    "SEQ": ["序號", "項次"],
+    "SHORT_QTY": ["欠料數量", "缺料數量"],
+    "STOCK": ["現有庫存", "庫存數量"],
+    "URGENT": ["急料"],
+    "MO_NUMBER": ["製令編號", "製令單號"],
+    "WO": ["製令", "專案代號"],
+    "ISSUE_DATE": ["發料日", "預計發料日"],
+    "ENTRY_DATE": ["入庫日", "預計入庫日"],
+    "CUSTOMER": ["客戶", "客戶簡稱"],
     "CATEGORY": ["CATEGORY", "類別"],
-    "FRAME": ["骨架/骨包", "FRAME/ FRAME SET", "FRAME SET", "FRAME"],
-    "PU": ["PU"],
-    "FACILITY": ["FACILITY"],
-    "OTHER": ["其他託外模組", "其他託外", "託(其他)"],
-    "RB": ["RB"],
-    "LP": ["LP"],
-    "AL": ["AL"],
-    "FFU": ["FFU"],
-    "X_TABLE": ["X-TABLE", "XTABLE", "X軸"],
-    "MACHINED": ["加工件", "加工件(交期)", "加工件缺料(不含模組.市購件)"],
-    "MARKET": ["市購件", "RZ市構件"],
-    "CUSTOMER": ["客供", "客供料"],
-    "SIGNAL": ["SIGNAL"],
-    "INTERLOCK": ["INTERLOCK"],
-}
-NORMALIZED_ALIASES = {
-    key: {normalize_header(alias) for alias in values} for key, values in ALIASES.items()
+    "LOCATION": ["組立地點", "組立/地點"],
+    "PROGRESS": ["組立進度", "進度"],
 }
 
 
-def clean_display_value(value: Any) -> str:
+def norm_header(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
-    if isinstance(value, (pd.Timestamp, datetime, date)):
-        return pd.Timestamp(value).strftime("%Y/%m/%d")
-    text = str(value).strip()
-    if not text or text.lower() == "nan":
+    return re.sub(r"[\s\n\r\t_（）()／/\-]+", "", str(value).strip().upper())
+
+
+NORMALIZED_ALIASES = {
+    key: {norm_header(alias) for alias in values} for key, values in ALIASES.items()
+}
+
+
+def clean_text(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
-    text = re.sub(r"(\d{4})-(\d{2})-(\d{2}) 00:00:00", r"\1/\2/\3", text)
-    return text
+    return str(value).strip()
 
 
-def is_meaningful(value: Any) -> bool:
-    text = clean_display_value(value)
-    return bool(text and text not in {"0", "0.0", "-"})
+def norm_material(value: Any) -> str:
+    return re.sub(r"\s+", "", clean_text(value)).upper()
 
 
-def find_header_row(df: pd.DataFrame) -> int:
-    wo_aliases = NORMALIZED_ALIASES["WO"]
-    for row_idx in range(min(15, len(df))):
-        values = {normalize_header(v) for v in df.iloc[row_idx].tolist()}
-        if values & wo_aliases:
-            return row_idx
-    raise ValueError("找不到『製令／專案代號』標題列。")
-
-
-def map_columns(df: pd.DataFrame, header_row: int, include_second_header: bool) -> dict[str, int]:
-    mapped: dict[str, int] = {}
-    rows = [header_row]
-    if include_second_header and header_row + 1 < len(df):
-        rows.append(header_row + 1)
-    for col_idx in range(df.shape[1]):
-        labels = {normalize_header(df.iat[r, col_idx]) for r in rows}
-        labels.discard("")
-        for standard, aliases in NORMALIZED_ALIASES.items():
-            if standard in mapped:
+def extract_wos(value: Any) -> list[str]:
+    text = clean_text(value).upper()
+    found: list[str] = []
+    for match in WO_PATTERN.finditer(text):
+        base, start_text, end_text = match.groups()
+        start = int(start_text)
+        if end_text:
+            end = int(end_text)
+            if start <= end <= 99 and end - start <= 50:
+                found.extend(f"{base}-{number:02d}" for number in range(start, end + 1))
                 continue
-            if labels & aliases:
-                mapped[standard] = col_idx
-    return mapped
+        found.append(f"{base}-{start:02d}")
+    return list(dict.fromkeys(found))
 
 
-def source_header_depth(df: pd.DataFrame, header_row: int) -> int:
-    if header_row + 1 >= len(df):
-        return 1
-    second = {normalize_header(v) for v in df.iloc[header_row + 1].tolist()}
-    status_aliases = set().union(
-        *(NORMALIZED_ALIASES[k] for k in ["FRAME", "PU", "FACILITY", "OTHER", "RB", "LP", "AL", "FFU", "X_TABLE", "MACHINED"])
-    )
-    return 2 if len(second & status_aliases) >= 2 else 1
+def to_number(value: Any) -> float:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return 0.0 if pd.isna(number) else float(number)
 
 
-def list_excel_sheets(file_bytes: bytes) -> list[str]:
-    return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+def to_date(value: Any) -> pd.Timestamp | pd.NaT:
+    if value is None or clean_text(value) in {"", "--", "-", "TBD", "NAN"}:
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce")
 
 
-def choose_target_sheet(file_bytes: bytes) -> tuple[list[str], str]:
-    sheets = list_excel_sheets(file_bytes)
-    best_sheet = sheets[0]
-    best_score = -1
-    for sheet in sheets:
-        try:
-            preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=15, dtype=object)
-            header_row = find_header_row(preview)
-            mapping = map_columns(preview, header_row, include_second_header=False)
-            score = len(mapping)
-            if "WO" in mapping and score > best_score:
-                best_score = score
-                best_sheet = sheet
-        except Exception:
-            continue
-    return sheets, best_sheet
-
-
-def read_target(file_name: str, file_bytes: bytes, sheet_name: str | None = None) -> tuple[pd.DataFrame, int, str]:
-    suffix = Path(file_name).suffix.lower()
-    if suffix == ".csv":
-        errors = []
-        for encoding in ["utf-8-sig", "utf-8", "cp950", "big5"]:
-            try:
-                df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding, dtype=object)
-                return df, 0, "CSV"
-            except Exception as exc:
-                errors.append(str(exc))
-        raise ValueError("CSV 編碼無法辨識，請另存為 UTF-8 CSV 後再試。")
-    if suffix not in {".xlsx", ".xlsm"}:
-        raise ValueError("物料追蹤彙整只支援 CSV、XLSX 或 XLSM。")
-    if not sheet_name:
-        _, sheet_name = choose_target_sheet(file_bytes)
-    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, dtype=object)
-    header_row = find_header_row(raw)
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row, dtype=object)
-    df.columns = [clean_display_value(c) or f"未命名欄位_{i + 1}" for i, c in enumerate(df.columns)]
-    return df, header_row, sheet_name
-
-
-def target_column_mapping(df: pd.DataFrame) -> dict[str, str]:
-    mapped: dict[str, str] = {}
+def find_column(df: pd.DataFrame, standard: str, required: bool = True) -> str | None:
+    aliases = NORMALIZED_ALIASES[standard]
     for col in df.columns:
-        label = normalize_header(col)
-        for standard, aliases in NORMALIZED_ALIASES.items():
-            if standard not in mapped and label in aliases:
-                mapped[standard] = col
-    return mapped
+        if norm_header(col) in aliases:
+            return col
+    if required:
+        readable = "／".join(ALIASES[standard])
+        raise ValueError(f"找不到必要欄位：{readable}")
+    return None
 
 
-def build_source_records(
-    file_bytes: bytes, selected_sheets: list[str]
-) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]], pd.DataFrame]:
-    workbook_sheets = list_excel_sheets(file_bytes)
-    selected = [s for s in workbook_sheets if s in selected_sheets]
-    if not selected:
-        raise ValueError("沒有選到可讀取的倉庫週別工作表。")
+def detect_sheet_and_header(file_bytes: bytes, required: list[str], preferred: list[str] | None = None) -> tuple[str, int]:
+    excel = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheets = excel.sheet_names
+    ordered = []
+    for name in (preferred or []):
+        if name in sheets and name not in ordered:
+            ordered.append(name)
+    ordered.extend(name for name in sheets if name not in ordered)
 
-    records: dict[tuple[str, str], dict[str, Any]] = {}
-    source_log: list[dict[str, Any]] = []
-    for sheet_order, sheet in enumerate(selected):
-        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, dtype=object)
-        if raw.empty:
-            continue
-        try:
-            header_row = find_header_row(raw)
-        except ValueError:
-            continue
-        depth = source_header_depth(raw, header_row)
-        columns = map_columns(raw, header_row, include_second_header=(depth == 2))
-        if "WO" not in columns:
-            continue
-        for row_idx in range(header_row + depth, len(raw)):
-            wo = normalize_key(raw.iat[row_idx, columns["WO"]])
-            if not wo:
+    best: tuple[int, str, int] | None = None
+    for sheet in ordered:
+        preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=15, dtype=object)
+        for row_idx in range(len(preview)):
+            labels = {norm_header(v) for v in preview.iloc[row_idx].tolist()}
+            score = sum(bool(labels & NORMALIZED_ALIASES[item]) for item in required)
+            candidate = (score, sheet, row_idx)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+            if score == len(required):
+                return sheet, row_idx
+    if not best or best[0] < len(required):
+        missing = "、".join(required)
+        raise ValueError(f"找不到符合欄位的工作表：{missing}")
+    return best[1], best[2]
+
+
+def read_auto(file_bytes: bytes, required: list[str], preferred: list[str] | None = None) -> tuple[pd.DataFrame, str]:
+    sheet, header_row = detect_sheet_and_header(file_bytes, required, preferred)
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=header_row, dtype=object)
+    df = df.dropna(how="all").copy()
+    return df, sheet
+
+
+def prepare_receipt(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    df, sheet = read_auto(file_bytes, ["MATERIAL", "RECEIPT_QTY", "NOTE"], ["單身資料"])
+    receipt_no = ""
+    try:
+        header_df, _ = read_auto(file_bytes, ["RECEIPT_NO"], ["單頭資料"])
+        receipt_no_col = find_column(header_df, "RECEIPT_NO")
+        receipt_no_values = header_df[receipt_no_col].dropna().map(clean_text)
+        if not receipt_no_values.empty:
+            receipt_no = receipt_no_values.iloc[0]
+    except (ValueError, KeyError):
+        pass
+    material_col = find_column(df, "MATERIAL")
+    qty_col = find_column(df, "RECEIPT_QTY")
+    note_col = find_column(df, "NOTE")
+    name_col = find_column(df, "NAME", False)
+    spec_col = find_column(df, "SPEC", False)
+    unit_col = find_column(df, "UNIT", False)
+    seq_col = find_column(df, "SEQ", False)
+
+    result = pd.DataFrame({
+        "領料單號": receipt_no,
+        "領料序號": df[seq_col].map(clean_text) if seq_col else [str(i + 1) for i in range(len(df))],
+        "材料品號": df[material_col].map(clean_text),
+        "品名": df[name_col].map(clean_text) if name_col else "",
+        "規格": df[spec_col].map(clean_text) if spec_col else "",
+        "領料數量": df[qty_col].map(to_number),
+        "單位": df[unit_col].map(clean_text) if unit_col else "",
+        "領料備註": df[note_col].map(clean_text),
+    })
+    result["_材料"] = result["材料品號"].map(norm_material)
+    result["_製令列表"] = result["領料備註"].map(extract_wos)
+    result = result[(result["_材料"] != "") & (result["領料數量"] > 0)].reset_index(drop=True)
+    return result, sheet
+
+
+def prepare_shortage(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    df, sheet = read_auto(file_bytes, ["MATERIAL", "SHORT_QTY", "NOTE"])
+    material_col = find_column(df, "MATERIAL")
+    shortage_col = find_column(df, "SHORT_QTY")
+    note_col = find_column(df, "NOTE")
+    name_col = find_column(df, "NAME", False)
+    spec_col = find_column(df, "SPEC", False)
+    stock_col = find_column(df, "STOCK", False)
+    urgent_col = find_column(df, "URGENT", False)
+    mo_col = find_column(df, "MO_NUMBER", False)
+
+    result = pd.DataFrame({
+        "材料品號": df[material_col].map(clean_text),
+        "品名": df[name_col].map(clean_text) if name_col else "",
+        "規格": df[spec_col].map(clean_text) if spec_col else "",
+        "製令編號": df[mo_col].map(clean_text) if mo_col else "",
+        "急料": df[urgent_col].map(clean_text) if urgent_col else "",
+        "欠料數量": df[shortage_col].map(to_number),
+        "現有庫存": df[stock_col].map(to_number) if stock_col else 0.0,
+        "欠料備註": df[note_col].map(clean_text),
+    })
+    result["_材料"] = result["材料品號"].map(norm_material)
+    result["_製令列表"] = result["欠料備註"].map(extract_wos)
+    result = result.explode("_製令列表", ignore_index=True).rename(columns={"_製令列表": "製令"})
+    result["製令"] = result["製令"].fillna("").map(clean_text)
+    result = result[(result["_材料"] != "") & (result["製令"] != "") & (result["欠料數量"] > 0)].reset_index(drop=True)
+    result["_欠料列"] = result.index + 2
+    return result, sheet
+
+
+def prepare_schedule(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
+    df, sheet = read_auto(file_bytes, ["WO", "ISSUE_DATE"], ["2026排程"])
+    wo_col = find_column(df, "WO")
+    issue_col = find_column(df, "ISSUE_DATE")
+    customer_col = find_column(df, "CUSTOMER", False)
+    category_col = find_column(df, "CATEGORY", False)
+    location_col = find_column(df, "LOCATION", False)
+    entry_col = find_column(df, "ENTRY_DATE", False)
+    progress_col = find_column(df, "PROGRESS", False)
+
+    result = pd.DataFrame({
+        "製令原值": df[wo_col].map(clean_text),
+        "客戶": df[customer_col].map(clean_text) if customer_col else "",
+        "Category": df[category_col].map(clean_text) if category_col else "",
+        "組立地點": df[location_col].map(clean_text) if location_col else "",
+        "組立進度": df[progress_col].map(clean_text) if progress_col else "",
+        "發料日": df[issue_col].map(to_date),
+        "入庫日": df[entry_col].map(to_date) if entry_col else pd.NaT,
+    })
+    result["_製令列表"] = result["製令原值"].map(extract_wos)
+    result = result.explode("_製令列表", ignore_index=True).rename(columns={"_製令列表": "製令"})
+    result["製令"] = result["製令"].fillna("").map(clean_text)
+    result = result[result["製令"] != ""].copy()
+    result["_有日期"] = result["發料日"].notna().astype(int)
+    result = result.sort_values(["製令", "_有日期", "發料日"], ascending=[True, False, True], na_position="last")
+    result = result.drop_duplicates("製令", keep="first").drop(columns=["_有日期"])
+    return result.reset_index(drop=True), sheet
+
+
+def priority_info(issue_date: Any, base_date: date) -> tuple[int, str, int | None]:
+    if pd.isna(issue_date):
+        return 4, "4. 排程未找到", None
+    issued = pd.Timestamp(issue_date).date()
+    delta = (base_date - issued).days
+    if delta > 0:
+        return 1, "1. 已過發料日", delta
+    if delta == 0:
+        return 2, "2. 今日發料", 0
+    return 3, "3. 發料日未到", delta
+
+
+def analyze(
+    receipt: pd.DataFrame,
+    shortage: pd.DataFrame,
+    schedule: pd.DataFrame,
+    base_date: date,
+) -> dict[str, Any]:
+    schedule_map = schedule.set_index("製令").to_dict("index")
+    receipt_materials = set(receipt["_材料"])
+    shortage_status = shortage.copy().reset_index(drop=True)
+
+    for col in ["客戶", "Category", "組立地點", "組立進度", "發料日", "入庫日"]:
+        shortage_status[col] = shortage_status["製令"].map(
+            lambda wo: schedule_map.get(wo, {}).get(col, pd.NaT if "日" in col else "")
+        )
+    all_infos = shortage_status["發料日"].map(lambda value: priority_info(value, base_date))
+    shortage_status["_優先群組"] = all_infos.map(lambda x: x[0])
+    shortage_status["排程狀態"] = all_infos.map(lambda x: x[1])
+    shortage_status["逾期天數"] = all_infos.map(lambda x: x[2] if x[2] is not None and x[2] >= 0 else 0)
+    shortage_status["距發料日天數"] = all_infos.map(lambda x: abs(x[2]) if x[2] is not None and x[2] < 0 else 0)
+    shortage_status["_日期排序"] = shortage_status["發料日"].fillna(pd.Timestamp.max)
+    shortage_status = shortage_status.sort_values(
+        ["_優先群組", "_日期排序", "製令", "_材料", "_欠料列"], kind="stable"
+    ).reset_index(drop=True)
+
+    detail = shortage_status[
+        shortage_status["_材料"].isin(receipt_materials) & (shortage_status["_優先群組"] == 1)
+    ].copy()
+    detail["優先狀態"] = detail["排程狀態"]
+    detail["_日期排序"] = detail["發料日"].fillna(pd.Timestamp.max)
+    detail = detail.sort_values(["_日期排序", "製令", "_材料", "_欠料列"], kind="stable").reset_index(drop=True)
+
+    ordered_wos = list(dict.fromkeys(detail["製令"].tolist()))
+    wo_rank = {wo: rank for rank, wo in enumerate(ordered_wos, start=1)}
+    detail["製令優先序"] = detail["製令"].map(wo_rank)
+    detail["建議補料數量"] = 0.0
+    detail["領料來源序號"] = ""
+
+    by_material: dict[str, list[int]] = defaultdict(list)
+    for idx, row in detail.iterrows():
+        by_material[row["_材料"]].append(idx)
+
+    allocation_log: list[dict[str, Any]] = []
+    unmatched_receipt: list[dict[str, Any]] = []
+
+    for receipt_idx, receipt_row in receipt.iterrows():
+        material = receipt_row["_材料"]
+        remaining = float(receipt_row["領料數量"])
+        candidate_indices = list(by_material.get(material, []))
+        candidate_indices = sorted(candidate_indices, key=lambda idx: (
+            detail.at[idx, "_日期排序"], detail.at[idx, "製令"], detail.at[idx, "_欠料列"]
+        ))
+
+        for detail_idx in candidate_indices:
+            if remaining <= 0:
+                break
+            needed = max(float(detail.at[detail_idx, "欠料數量"]) - float(detail.at[detail_idx, "建議補料數量"]), 0)
+            allocated = min(remaining, needed)
+            if allocated <= 0:
                 continue
-            category = normalize_key(raw.iat[row_idx, columns["CATEGORY"]]) if "CATEGORY" in columns else ""
-            record: dict[str, Any] = {
-                "WO": wo,
-                "CATEGORY": category,
-                "來源工作表": sheet,
-                "來源列": row_idx + 1,
-                "工作表順序": sheet_order,
-            }
-            for status_key in ["FRAME", "PU", "FACILITY", "OTHER", "RB", "LP", "AL", "FFU", "X_TABLE", "MACHINED", "MARKET", "CUSTOMER"]:
-                record[status_key] = clean_display_value(raw.iat[row_idx, columns[status_key]]) if status_key in columns else ""
-            records[(wo, category)] = record
-            source_log.append(record.copy())
-
-    by_wo: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in records.values():
-        by_wo[record["WO"]].append(record)
-    for wo, candidates in list(by_wo.items()):
-        newest = max(r["工作表順序"] for r in candidates)
-        by_wo[wo] = [r for r in candidates if r["工作表順序"] == newest]
-    return records, dict(by_wo), pd.DataFrame(source_log)
-
-
-def extract_module_status(other_status: str, keyword: str) -> str:
-    if not other_status:
-        return ""
-    parts = re.split(r"[\n\r]+", other_status)
-    matches = [part.strip() for part in parts if keyword.upper() in part.upper()]
-    return "\n".join(matches)
-
-
-def source_status_for_target(record: dict[str, Any], target_standard: str) -> str:
-    if target_standard == "SIGNAL":
-        return extract_module_status(record.get("OTHER", ""), "SIGNAL")
-    if target_standard == "INTERLOCK":
-        return extract_module_status(record.get("OTHER", ""), "INTERLOCK")
-    return clean_display_value(record.get(target_standard, ""))
-
-
-def dated_status(status: str, update_date: date) -> str:
-    return f"【{update_date.strftime('%Y/%m/%d')} 倉庫更新】{status}"
-
-
-def compare_and_update(
-    target_df: pd.DataFrame,
-    exact_records: dict[tuple[str, str], dict[str, Any]],
-    records_by_wo: dict[str, list[dict[str, Any]]],
-    update_date: date,
-    write_mode: str = "append",
-    only_existing_shortage: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, int]]:
-    result = target_df.copy()
-    columns = target_column_mapping(result)
-    if "WO" not in columns:
-        raise ValueError("物料追蹤彙整找不到『專案代號／製令』欄位。")
-    if "CATEGORY" not in columns:
-        raise ValueError("物料追蹤彙整找不到『Category』欄位。")
-
-    status_fields = ["FRAME", "PU", "FACILITY", "OTHER", "RB", "LP", "AL", "FFU", "X_TABLE", "MACHINED", "MARKET", "CUSTOMER", "SIGNAL", "INTERLOCK"]
-    logs: list[dict[str, Any]] = []
-    unmatched: list[dict[str, Any]] = []
-    matched_rows: set[int] = set()
-    fallback_rows = 0
-
-    for idx, row in result.iterrows():
-        wo = normalize_key(row.get(columns["WO"]))
-        category = normalize_key(row.get(columns["CATEGORY"]))
-        if not wo:
-            continue
-        record = exact_records.get((wo, category))
-        match_type = "製令＋Category"
-        if record is None:
-            candidates = records_by_wo.get(wo, [])
-            if len(candidates) == 1:
-                record = candidates[0]
-                match_type = "製令（唯一資料）"
-                fallback_rows += 1
-
-        shortage_fields = [
-            field for field in status_fields if field in columns and is_meaningful(row.get(columns[field]))
-        ]
-        if record is None:
-            if shortage_fields:
-                unmatched.append({
-                    "目標列": int(idx) + 2,
-                    "製令": clean_display_value(row.get(columns["WO"])),
-                    "Category": clean_display_value(row.get(columns["CATEGORY"])),
-                    "原缺料欄位": "、".join(columns[field] for field in shortage_fields),
-                    "原因": "倉庫週別工作表查無相同製令＋Category",
-                })
-            continue
-
-        matched_rows.add(int(idx))
-        for standard in status_fields:
-            if standard not in columns:
-                continue
-            col_name = columns[standard]
-            original = clean_display_value(row.get(col_name))
-            if only_existing_shortage and not is_meaningful(original):
-                continue
-            warehouse_status = source_status_for_target(record, standard)
-            if not is_meaningful(warehouse_status):
-                continue
-            update_text = dated_status(warehouse_status, update_date)
-            if update_text in original:
-                continue
-            if write_mode == "overwrite":
-                updated = update_text
-            elif original:
-                updated = f"{original}\n{update_text}"
-            else:
-                updated = update_text
-            result.at[idx, col_name] = updated
-            logs.append({
-                "目標資料列": int(idx) + 2,
-                "製令": clean_display_value(row.get(columns["WO"])),
-                "Category": clean_display_value(row.get(columns["CATEGORY"])),
-                "更新欄位": col_name,
-                "原缺料": original,
-                "倉庫最新狀態": warehouse_status,
-                "更新後": updated,
-                "更新日期": update_date.strftime("%Y/%m/%d"),
-                "比對方式": match_type,
-                "來源工作表": record["來源工作表"],
-                "來源列": record["來源列"],
-                "目標索引": int(idx),
+            detail.at[detail_idx, "建議補料數量"] += allocated
+            previous = clean_text(detail.at[detail_idx, "領料來源序號"])
+            seq = clean_text(receipt_row["領料序號"])
+            detail.at[detail_idx, "領料來源序號"] = f"{previous}、{seq}" if previous else seq
+            remaining -= allocated
+            allocation_log.append({
+                "補料次序": 0,
+                "領料單號": receipt_row["領料單號"],
+                "製令優先序": int(detail.at[detail_idx, "製令優先序"]),
+                "優先狀態": detail.at[detail_idx, "優先狀態"],
+                "製令": detail.at[detail_idx, "製令"],
+                "發料日": detail.at[detail_idx, "發料日"],
+                "材料品號": receipt_row["材料品號"],
+                "品名": receipt_row["品名"],
+                "領料序號": receipt_row["領料序號"],
+                "領料數量": receipt_row["領料數量"],
+                "該列欠料數量": detail.at[detail_idx, "欠料數量"],
+                "建議補料數量": allocated,
+                "領料備註": receipt_row["領料備註"],
             })
 
+        if remaining > 0:
+            reason = "已過發料日的製令缺料中查無此材料品號" if not candidate_indices else "領料數量超過已過發料日製令的欠料數量"
+            unmatched_receipt.append({
+                "領料單號": receipt_row["領料單號"], "領料序號": receipt_row["領料序號"], "材料品號": receipt_row["材料品號"],
+                "品名": receipt_row["品名"], "領料數量": receipt_row["領料數量"], "未分配數量": remaining,
+                "領料備註": receipt_row["領料備註"], "原因": reason,
+            })
+
+    detail["補料判定"] = detail.apply(
+        lambda row: "可由本次領料補料" if row["建議補料數量"] > 0
+        else "領料量已優先分配給更早逾期製令",
+        axis=1,
+    )
+
+    allocation_df = pd.DataFrame(allocation_log)
+    if not allocation_df.empty:
+        allocation_df = allocation_df.sort_values(["製令優先序", "發料日", "製令", "材料品號"], kind="stable").reset_index(drop=True)
+        allocation_df["補料次序"] = range(1, len(allocation_df) + 1)
+
+    summary = shortage_status.groupby("製令", as_index=False).agg(
+        缺料品項數=("材料品號", "size"),
+        欠料總數量=("欠料數量", "sum"),
+    )
+    matched_summary = detail.groupby("製令", as_index=False).agg(
+        可比對領料品項數=("材料品號", "size"),
+        可補料品項數=("建議補料數量", lambda s: int((s > 0).sum())),
+        建議補料總數量=("建議補料數量", "sum"),
+    )
+    summary = summary.merge(matched_summary, on="製令", how="left")
+    for col in ["可比對領料品項數", "可補料品項數", "建議補料總數量"]:
+        summary[col] = summary[col].fillna(0)
+    for col in ["客戶", "Category", "組立地點", "發料日", "入庫日"]:
+        summary[col] = summary["製令"].map(lambda wo: schedule_map.get(wo, {}).get(col, pd.NaT if "日" in col else ""))
+    summary["排程狀態"] = summary["發料日"].map(lambda value: priority_info(value, base_date)[1])
+    summary["_優先群組"] = summary["發料日"].map(lambda value: priority_info(value, base_date)[0])
+    summary["_日期排序"] = summary["發料日"].fillna(pd.Timestamp.max)
+    summary = summary.sort_values(["_優先群組", "_日期排序", "製令"], kind="stable").reset_index(drop=True)
+    summary.insert(0, "製令排序", range(1, len(summary) + 1))
+    summary = summary.drop(columns=["_優先群組", "_日期排序"])
+
+    visible_columns = [
+        "製令優先序", "優先狀態", "逾期天數", "製令", "客戶", "Category", "組立地點",
+        "發料日", "入庫日", "材料品號", "品名", "規格", "製令編號", "急料", "欠料數量", "現有庫存",
+        "建議補料數量", "補料判定", "領料來源序號", "欠料備註", "_欠料列",
+    ]
+    detail_visible = detail[visible_columns].rename(columns={"_欠料列": "欠料表列號"})
+    shortage_status_columns = [
+        "排程狀態", "逾期天數", "距發料日天數", "製令", "客戶", "Category", "組立地點",
+        "發料日", "入庫日", "材料品號", "品名", "規格", "製令編號", "急料", "欠料數量",
+        "現有庫存", "欠料備註", "_欠料列",
+    ]
+    shortage_status_visible = shortage_status[shortage_status_columns].rename(columns={"_欠料列": "欠料表列號"})
+    unmatched_df = pd.DataFrame(unmatched_receipt)
     stats = {
-        "目標總列數": len(result),
-        "成功比對列數": len(matched_rows),
-        "更新儲存格數": len(logs),
-        "未比對列數": len(unmatched),
-        "製令唯一值備援比對列數": fallback_rows,
+        "領料筆數": len(receipt),
+        "領料單號": "、".join(receipt["領料單號"].dropna().astype(str).unique().tolist()),
+        "缺料製令數": shortage_status["製令"].nunique(),
+        "逾期製令數": len(ordered_wos),
+        "逾期缺料筆數": len(detail_visible),
+        "可補料明細數": len(allocation_df),
+        "未分配領料筆數": len(unmatched_df),
     }
-    return result, pd.DataFrame(logs), pd.DataFrame(unmatched), stats
+    return {
+        "allocation": allocation_df,
+        "detail": detail_visible,
+        "shortage_status": shortage_status_visible,
+        "summary": summary,
+        "unmatched": unmatched_df,
+        "stats": stats,
+    }
 
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
-UPDATED_FILL = PatternFill("solid", fgColor="FFF2CC")
+PRIORITY_FILLS = {
+    "1. 已過發料日": PatternFill("solid", fgColor="F4CCCC"),
+    "2. 今日發料": PatternFill("solid", fgColor="FFF2CC"),
+    "3. 發料日未到": PatternFill("solid", fgColor="D9EAD3"),
+    "4. 排程未找到": PatternFill("solid", fgColor="E7E6E6"),
+}
 
 
-def style_data_sheet(ws, data_row_height: int = 45) -> None:
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    ws.row_dimensions[1].height = 28
-    for cell in ws[1]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for col_idx in range(1, ws.max_column + 1):
-        values = [clean_display_value(ws.cell(row=r, column=col_idx).value) for r in range(1, min(ws.max_row, 80) + 1)]
-        width = min(max(max((len(v) for v in values), default=8) + 2, 10), 34)
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    for row in ws.iter_rows(min_row=2):
-        ws.row_dimensions[row[0].row].height = data_row_height
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+def excel_value(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and pd.isna(value)) or value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if hasattr(value, "item") and not isinstance(value, (str, bytes, date, datetime)):
+        try:
+            return value.item()
+        except (AttributeError, ValueError):
+            pass
+    return value
 
 
-def add_dataframe_sheet(wb, title: str, df: pd.DataFrame, drop_internal: bool = False) -> None:
-    if title in wb.sheetnames:
-        del wb[title]
+def add_sheet(wb: Workbook, title: str, df: pd.DataFrame) -> None:
     ws = wb.create_sheet(title)
     data = df.copy()
-    if drop_internal:
-        data = data.drop(columns=[c for c in ["目標索引"] if c in data.columns], errors="ignore")
     if data.empty and len(data.columns) == 0:
         data = pd.DataFrame({"結果": ["無資料"]})
     for col_idx, col in enumerate(data.columns, start=1):
-        ws.cell(row=1, column=col_idx, value=str(col))
+        cell = ws.cell(row=1, column=col_idx, value=str(col))
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    priority_col = list(data.columns).index("優先狀態") + 1 if "優先狀態" in data.columns else None
+    date_cols = {i + 1 for i, col in enumerate(data.columns) if "日期" in str(col) or str(col) in {"發料日", "入庫日"}}
     for row_idx, values in enumerate(data.itertuples(index=False, name=None), start=2):
+        fill = PRIORITY_FILLS.get(clean_text(values[priority_col - 1])) if priority_col else None
         for col_idx, value in enumerate(values, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=clean_display_value(value))
-    style_data_sheet(ws)
-
-
-def build_output_workbook(
-    target_name: str,
-    target_bytes: bytes,
-    target_sheet: str,
-    target_header_row: int,
-    updated_df: pd.DataFrame,
-    update_log: pd.DataFrame,
-    unmatched_df: pd.DataFrame,
-) -> bytes:
-    suffix = Path(target_name).suffix.lower()
-    if suffix == ".csv":
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "物料追蹤彙整_更新後"
-        for col_idx, col in enumerate(updated_df.columns, start=1):
-            ws.cell(row=1, column=col_idx, value=str(col))
-        for row_idx, values in enumerate(updated_df.itertuples(index=False, name=None), start=2):
-            for col_idx, value in enumerate(values, start=1):
-                ws.cell(row=row_idx, column=col_idx, value=clean_display_value(value))
-        style_data_sheet(ws)
-        for item in update_log.to_dict("records"):
-            target_idx = int(item["目標索引"]) + 2
-            target_col = list(updated_df.columns).index(item["更新欄位"]) + 1
-            ws.cell(row=target_idx, column=target_col).fill = UPDATED_FILL
-    else:
-        keep_vba = suffix == ".xlsm"
-        wb = load_workbook(io.BytesIO(target_bytes), keep_vba=keep_vba)
-        ws = wb[target_sheet]
-        header_excel_row = target_header_row + 1
-        header_map = {
-            clean_display_value(ws.cell(row=header_excel_row, column=c).value): c
-            for c in range(1, ws.max_column + 1)
-        }
-        for item in update_log.to_dict("records"):
-            col_name = item["更新欄位"]
-            if col_name not in header_map:
-                continue
-            excel_row = header_excel_row + 1 + int(item["目標索引"])
-            cell = ws.cell(row=excel_row, column=header_map[col_name])
-            cell.value = item["更新後"]
+            cell = ws.cell(row=row_idx, column=col_idx, value=excel_value(value))
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.fill = UPDATED_FILL
+            if col_idx in date_cols and isinstance(cell.value, datetime):
+                cell.number_format = "yyyy-mm-dd"
+            if fill:
+                cell.fill = fill
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    ws.row_dimensions[1].height = 30
+    for col_idx, col in enumerate(data.columns, start=1):
+        samples = [str(col)] + [clean_text(v) for v in data.iloc[:100, col_idx - 1].tolist()]
+        width = min(max(max((len(v) for v in samples), default=8) + 2, 10), 34)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    add_dataframe_sheet(wb, "自動比對紀錄", update_log, drop_internal=True)
-    add_dataframe_sheet(wb, "未比對清單", unmatched_df)
+
+def build_output_excel(result: dict[str, Any], base_date: date, sources: dict[str, str]) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+    info = pd.DataFrame({
+        "項目": ["判斷基準日", "比對規則", "排序規則", "領料單工作表", "製令欠料工作表", "製程排程工作表"],
+        "內容": [
+            base_date.strftime("%Y/%m/%d"),
+            "依領料單的材料品號，比對發料日早於判斷基準日的製令缺料；不限制領料備註中的製令。",
+            "發料日逾期較久的製令優先；相同製令依材料品號排序，補料數量不超過欠料數量。",
+            sources.get("receipt", ""), sources.get("shortage", ""), sources.get("schedule", ""),
+        ],
+    })
+    add_sheet(wb, "使用說明", info)
+    add_sheet(wb, "建議補料順序", result["allocation"])
+    add_sheet(wb, "製令缺料彙總", result["summary"])
+    add_sheet(wb, "逾期製令缺料比對", result["detail"])
+    add_sheet(wb, "未分配領料", result["unmatched"])
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()
@@ -419,101 +474,100 @@ def build_output_workbook(
 
 def main() -> None:
     if st is None:
-        raise RuntimeError("尚未安裝 Streamlit，請先執行 pip install -r requirements.txt。")
+        raise RuntimeError("尚未安裝 Streamlit，請執行 pip install -r requirements.txt。")
+
     st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
-    st.title("📦 倉庫物管發料 × 物料追蹤彙整")
-    st.caption("依『製令＋Category』比對，保留原缺料內容並追加日期與倉庫最新狀態。")
+    st.title("📦 生管排程 × 製令缺料 × 客戶領料補料")
+    st.success(f"目前版本：{APP_VERSION}")
+    st.caption("生管排程確認發料日，製令缺料表確認缺料；客戶領回料件暫時不看製令，只依料號補到已過發料日的製令。")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        target_file = st.file_uploader("① 上傳物料追蹤彙整（CSV／XLSX）", type=["csv", "xlsx", "xlsm"])
-    with col2:
-        warehouse_file = st.file_uploader("② 上傳倉庫物管發料（XLSX）", type=["xlsx"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        schedule_file = st.file_uploader("① 上傳生管排程表（XLSX）", type=["xlsx"], key="schedule")
+    with c2:
+        shortage_file = st.file_uploader("② 上傳製令缺料表（XLSX）", type=["xlsx"], key="shortage")
+    with c3:
+        receipt_file = st.file_uploader("③ 上傳客戶端領料單（XLSX）", type=["xlsx"], key="receipt")
 
-    if not target_file or not warehouse_file:
-        st.info("請先上傳兩份檔案。程式不會改動原始檔，完成後會產生新的 Excel。")
+    base_date = st.date_input("判斷基準日", value=date.today())
+    st.info("僅比對發料日早於判斷基準日的製令；今日及未來發料的製令不納入補料。")
+
+    if not receipt_file or not shortage_file or not schedule_file:
+        st.info("請依序上傳生管排程表、製令缺料表、客戶端領料單三份檔案。")
         return
 
-    target_bytes = target_file.getvalue()
-    warehouse_bytes = warehouse_file.getvalue()
-    target_sheet = "CSV"
-    if Path(target_file.name).suffix.lower() != ".csv":
-        target_sheets, suggested = choose_target_sheet(target_bytes)
-        target_sheet = st.selectbox("物料追蹤彙整工作表", target_sheets, index=target_sheets.index(suggested))
-
-    all_source_sheets = list_excel_sheets(warehouse_bytes)
-    weekly_sheets = [s for s in all_source_sheets if WEEKLY_SHEET_PATTERN.fullmatch(s)]
-    scope = st.radio("倉庫資料範圍", ["自動抓全部週別（同製令採較後工作表）", "只抓最新週別", "手動選擇週別"], horizontal=True)
-    if scope.startswith("自動"):
-        selected_source_sheets = weekly_sheets
-    elif scope.startswith("只抓"):
-        selected_source_sheets = weekly_sheets[-1:] if weekly_sheets else []
-    else:
-        selected_source_sheets = st.multiselect("選擇週別工作表", weekly_sheets, default=weekly_sheets[-2:])
-
-    option1, option2, option3 = st.columns(3)
-    with option1:
-        update_date = st.date_input("備註更新日期", value=date.today())
-    with option2:
-        write_label = st.selectbox("寫入方式", ["保留原缺料並追加", "直接覆蓋原缺料"])
-    with option3:
-        only_existing = st.checkbox("只更新原本有缺料內容的欄位", value=True)
-
-    if st.button("開始比對並產生更新檔", type="primary", use_container_width=True):
+    if st.button("開始比對並產生補料順序", type="primary", use_container_width=True):
         try:
-            with st.spinner("正在讀取、比對並製作 Excel…"):
-                target_df, target_header_row, actual_target_sheet = read_target(
-                    target_file.name,
-                    target_bytes,
-                    None if target_sheet == "CSV" else target_sheet,
-                )
-                exact_records, records_by_wo, _ = build_source_records(warehouse_bytes, selected_source_sheets)
-                updated_df, update_log, unmatched_df, stats = compare_and_update(
-                    target_df,
-                    exact_records,
-                    records_by_wo,
-                    update_date,
-                    write_mode="overwrite" if write_label.startswith("直接") else "append",
-                    only_existing_shortage=only_existing,
-                )
-                output_bytes = build_output_workbook(
-                    target_file.name,
-                    target_bytes,
-                    actual_target_sheet,
-                    target_header_row,
-                    updated_df,
-                    update_log,
-                    unmatched_df,
-                )
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("目標資料", f"{stats['目標總列數']} 列")
-            m2.metric("成功比對", f"{stats['成功比對列數']} 列")
-            m3.metric("已更新", f"{stats['更新儲存格數']} 格")
-            m4.metric("未比對", f"{stats['未比對列數']} 列")
-
-            if not update_log.empty:
-                st.subheader("更新預覽")
-                st.dataframe(
-                    update_log.drop(columns=["目標索引"], errors="ignore").head(200),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.warning("沒有可寫入的更新。請確認週別範圍、製令、Category，以及目標欄位原本是否有缺料內容。")
-
-            output_name = f"物料追蹤彙整_已更新_{update_date.strftime('%Y%m%d')}.xlsx"
-            st.download_button(
-                "下載更新後 Excel",
-                data=output_bytes,
-                file_name=output_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-            )
-            st.caption("更新儲存格以淡黃色標示；另附『自動比對紀錄』與『未比對清單』工作表。")
+            with st.spinner("正在讀取三份資料並計算補料優先順序，欠料表較大時請稍候…"):
+                receipt, receipt_sheet = prepare_receipt(receipt_file.getvalue())
+                shortage, shortage_sheet = prepare_shortage(shortage_file.getvalue())
+                schedule, schedule_sheet = prepare_schedule(schedule_file.getvalue())
+                result = analyze(receipt, shortage, schedule, base_date)
+                output = build_output_excel(result, base_date, {
+                    "receipt": receipt_sheet, "shortage": shortage_sheet, "schedule": schedule_sheet,
+                })
+                st.session_state["analysis_result"] = result
+                st.session_state["analysis_output"] = output
+                st.session_state["analysis_date"] = base_date
         except Exception as exc:
             st.error(f"處理失敗：{exc}")
+
+    if "analysis_result" not in st.session_state:
+        return
+
+    result = st.session_state["analysis_result"]
+    stats = result["stats"]
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("領料單號", stats["領料單號"] or "未取得")
+    m2.metric("缺料表製令", f"{stats['缺料製令數']} 張")
+    m3.metric("已過發料日可比對製令", f"{stats['逾期製令數']} 張")
+    m4.metric("料號相符的逾期缺料", f"{stats['逾期缺料筆數']} 筆")
+    m5.metric("建議補料", f"{stats['可補料明細數']} 筆")
+    m6.metric("未分配領料", f"{stats['未分配領料筆數']} 筆")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "建議補料順序", "逾期製令缺料比對", "全部製令缺料狀況", "製令缺料彙總", "未分配領料"
+    ])
+    with tab1:
+        if result["allocation"].empty:
+            st.warning("領料單的材料品號在已超過發料日的製令缺料中沒有可補料項目。")
+        else:
+            st.dataframe(result["allocation"], use_container_width=True, hide_index=True, height=520)
+    with tab2:
+        detail = result["detail"]
+        selected_wo = st.multiselect("篩選逾期製令", sorted(detail["製令"].dropna().unique().tolist()))
+        show = detail[detail["製令"].isin(selected_wo)] if selected_wo else detail
+        st.dataframe(show.head(10000), use_container_width=True, hide_index=True, height=580)
+        if len(show) > 10000:
+            st.caption("畫面僅預覽前 10,000 筆，下載 Excel 仍包含全部資料。")
+    with tab3:
+        all_shortage = result["shortage_status"]
+        all_selected_wo = st.multiselect(
+            "選擇製令查看所有缺料料件",
+            sorted(all_shortage["製令"].dropna().unique().tolist()),
+            key="all_shortage_wo",
+        )
+        all_show = all_shortage[all_shortage["製令"].isin(all_selected_wo)] if all_selected_wo else all_shortage
+        st.dataframe(all_show.head(10000), use_container_width=True, hide_index=True, height=580)
+        if len(all_show) > 10000:
+            st.caption("畫面僅預覽前 10,000 筆；可先選擇製令縮小範圍。")
+    with tab4:
+        st.dataframe(result["summary"], use_container_width=True, hide_index=True)
+    with tab5:
+        if result["unmatched"].empty:
+            st.success("所有領料數量均已分配到指定製令缺料。")
+        else:
+            st.dataframe(result["unmatched"], use_container_width=True, hide_index=True, height=450)
+
+    output_date = st.session_state["analysis_date"].strftime("%Y%m%d")
+    st.download_button(
+        "下載領料單逾期製令補料 Excel",
+        data=st.session_state["analysis_output"],
+        file_name=f"領料單逾期製令補料_{output_date}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
 
 
 if __name__ == "__main__":
